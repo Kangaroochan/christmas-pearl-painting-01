@@ -1,10 +1,14 @@
 # 圣诞珍珠画01
 
-把一段生图提示词或一组参考图，改写成批量生成时每张都有明显差异、又看得出是同一个系列的提示词。深度拆解固定层和变量层，每张参考图输出一条可以直接丢进生图工具批量跑的提示词，并存成 TXT，放在参考图旁边。
+圣诞老人和小鹿珠钻画挂饰那套三张轮播的批量模板：
 
-只写提示词，不出图。出图用 [pinshuai-batch-image](https://github.com/Kangaroochan/pinshuai-batch-image)，它会直接读取这里写好的 TXT。
+1. 开场四宫格："10/10 Christmas activity to / do with your mom/sister 🎄"
+2. 和妈妈一起做："Ornament Kit 🥹"
+3. 挂在树上："that’s our December evenings sorted...🫶🏼"
 
-出图后的反馈会记进 `references/lessons.md`，下次写提示词前先读，少犯同样的错。
+文案、emoji、产品、人物选角和负面约束写死在 `template/carousel.json`。脚本给每套、每张画面写一条提示词，场景、机位、景别等可变点的取值由脚本定好并在各套之间轮换，不靠模型自己挑。同时写出可以直接交给 [pinshuai-batch-image](https://github.com/Kangaroochan/pinshuai-batch-image) 的 `jobs-试跑.json` 和 `jobs-正式.json`。
+
+只写提示词，不出图。别的参考图要做提示词多样化，用 [pinshuai-prompt-diversify](https://github.com/Kangaroochan/pinshuai-prompt-diversify)（本 skill 就是从它复制出来的）。
 
 ## 安装
 
@@ -14,18 +18,23 @@
 git clone https://github.com/Kangaroochan/christmas-pearl-painting-01.git "$env:USERPROFILE\.codex\skills\圣诞珍珠画01"
 ```
 
-可选的素材池脚本 `scripts/sample_prompts.py` 需要 Python 3，只用标准库。
+脚本需要 Python 3，只用标准库。
 
 ## 使用
 
-在 Codex 里调用 `$圣诞珍珠画01`，给出参考图或原提示词。默认只输出提示词；要素材池、Excel 或"严格保证每两张至少 N 处不同"时再说明。
+在 Codex 里调用 `$圣诞珍珠画01`，说要几套、什么深度（1～10，默认 10）。也可以直接跑：
+
+```powershell
+python scripts/make_batch.py --sets 10 --depth 10 -o D:/出图任务/圣诞01
+python scripts/make_batch.py --check
+```
 
 ## 文件
 
 - `SKILL.md`：skill 规则
-- `references/lessons.md`：出图经验记录，里面是作者自己的出图记录，可以清空成模板再用
-- `references/example_christmas.md`、`references/example_christmas_spec.json`：完整示例
-- `scripts/sample_prompts.py`：素材池抽取脚本（可选输出）
+- `template/carousel.json`：模板；`template/参考图/`、`template/产品图/`：原始截图和产品裁图
+- `scripts/make_batch.py`：按模板生成一批；`scripts/sample_prompts.py`：抽取引擎
+- `references/lessons.md`：出图经验记录，里面是作者自己的出图记录
 
 ## 许可
 

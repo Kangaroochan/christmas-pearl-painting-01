@@ -23,6 +23,7 @@
                     [{"positions": ["格1", ...],          # 模板里的位置占位符
                       "roles": {角色: {"pool": [...]}},     # 数量必须等于 positions 数量
                       "shuffle": true,                     # 是否打乱角色所在位置
+                      "avoid_identity": false,             # 打乱时不出现 roles 原来的顺序
                       "position_slots": {                  # 可选：每个位置各抽一次的插槽
                           "机位": {"pool": [...], "distinct": true}   # distinct=同一张图里各位置互不相同
                       }}]
@@ -93,6 +94,7 @@ class Spec:
                 "roles": {r: {"pool": clean_pool(r, c["pool"]), "max_uses": c.get("max_uses")}
                           for r, c in roles.items()},
                 "shuffle": g.get("shuffle", True) and len(positions) > 1,
+                "avoid_identity": g.get("avoid_identity", False),
                 "position_slots": pslots,
             })
         self.conflicts = raw.get("conflicts", [])
@@ -198,6 +200,8 @@ def draw(spec, usage, cap, rng):
         order = list(g["roles"])
         if g["shuffle"]:
             rng.shuffle(order)
+            while g["avoid_identity"] and order == list(g["roles"]):
+                rng.shuffle(order)
             dims[f"排列{gi+1}"] = "；".join(f"{p}={r}" for p, r in zip(g["positions"], order))
         for p, r in zip(g["positions"], order):
             values[p] = dims[r]
