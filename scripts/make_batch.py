@@ -9,8 +9,7 @@
 输出到一个新文件夹（不覆盖已有内容）：
     提示词/第01套-1-四宫格-提示词.txt ……   每条提示词，UTF-8，内容就是要提交的全文
     参考图/                                出图要带的产品图（--screenshot 时还有整张截图）
-    jobs-试跑.json                         第 1 套，给 pinshuai-batch-image 的 render.py
-    jobs-正式.json                         第 2 套起
+    jobs.json                              全部套数，给 pinshuai-batch-image 的 render.py 一次跑完
     抽取明细.csv                           每条每个可变点取了什么、是不是原图做法
     batch.json                             深度、种子、各画面变了几处、实际最小差异
 
@@ -65,10 +64,104 @@ def sentinel(name):
     return f"\x00{name}\x00"
 
 
+def product_names(tpl):
+    pool = tpl.get("product_pool")
+    if not isinstance(pool, dict):
+        return set()
+    count = pool.get("per_set", 0)
+    return {"产品"} | {f"款式{i}" for i in range(1, count + 1)} if isinstance(count, int) and not isinstance(count, bool) and count > 0 else {"产品"}
+
+
+def map_strings(value, fn):
+    if isinstance(value, str):
+        return fn(value)
+    if isinstance(value, list):
+        return [map_strings(v, fn) for v in value]
+    if isinstance(value, dict):
+        return {k: map_strings(v, fn) for k, v in value.items()}
+    return value
+
+
+def product_values(tpl, items):
+    return {"产品": tpl["product_pool"]["common_description"] + "".join(p["description"] for p in items),
+            **{f"款式{i}": p["name"] for i, p in enumerate(items, 1)}}
+
+
+def deal_products(tpl, sets, seed, wanted=None):
+    """独立随机流；每步优先最低使用次数，保持全池次数差≤1；组合尽量不在整批里重复。"""
+    pool = tpl.get("product_pool")
+    if pool is None:
+        if wanted:
+            raise TemplateError("--products 需要模板定义 product_pool")
+        return None
+    items, k = pool["items"], pool["per_set"]
+    names = {p["name"] for p in items}
+    if wanted:
+        if len(set(wanted)) != len(wanted):
+            raise TemplateError("--products 不能重复点名同一款")
+        if set(wanted) - names:
+            raise TemplateError(f"--products 款名不在池里：{sorted(set(wanted) - names)}")
+        if len(wanted) < k:
+            raise TemplateError(f"--products 至少指定 {k} 款")
+        by_name = {p["name"]: p for p in items}
+        eligible = [by_name[n] for n in wanted]
+    else:
+        eligible = items
+    rng = random.Random(f"{seed}|products")
+    # 同一组合在整批里重复出现也会让批次显得重复：多发几轮，取重复组合最少的一轮
+    best, best_repeats, last_error = None, None, None
+    for _ in range(200 if len(eligible) > k else 1):
+        try:
+            rows = deal_product_rows(eligible, k, sets, rng)
+        except TemplateError as e:
+            last_error = e
+            continue
+        repeats = len(rows) - len({frozenset(p["name"] for p in row) for row in rows})
+        if best is None or repeats < best_repeats:
+            best, best_repeats = rows, repeats
+        if repeats == 0:
+            break
+    if best is None:
+        raise last_error
+    return {"rows": best, "source": "用户指定" if wanted else "每套轮换", "requested": wanted,
+            "repeated_combos": best_repeats,
+            "counts": {p["name"]: sum(p in row for row in best) for p in items}}
+
+
+def deal_product_rows(eligible, k, sets, rng):
+    """一轮发牌：每步优先最低使用次数，保持次数差≤1，优先没用过的组合，相邻两套不同组。"""
+    counts, rows, previous, used = [0] * len(eligible), [], set(), set()
+    for _ in range(sets):
+        low = min(counts)
+        least = [i for i, c in enumerate(counts) if c == low]
+        higher = [i for i, c in enumerate(counts) if c > low]
+        take_low = min(k, len(least))
+        chosen = set(rng.sample(least, take_low) + rng.sample(higher, k - take_low))
+        for _ in range(50 if len(eligible) > k else 0):
+            if frozenset(chosen) not in used:
+                break
+            chosen = set(rng.sample(least, take_low) + rng.sample(higher, k - take_low))
+        if chosen == previous and len(eligible) > k:
+            swaps = [(a, b) for a in sorted(chosen) for b in range(len(eligible))
+                     if b not in chosen and counts[a] == counts[b]]
+            if not swaps:
+                raise TemplateError("无法在均衡次数的同时避免相邻同组")
+            a, b = rng.choice(swaps)
+            chosen.remove(a); chosen.add(b)
+        rows.append([eligible[i] for i in sorted(chosen)])
+        for i in chosen:
+            counts[i] += 1
+        previous = chosen
+        used.add(frozenset(chosen))
+    return rows
+
+
 def build(tpl, slide, depth):
     """把一张画面的模板按深度转成 sample_prompts 的规格。"""
     body = text(slide["template"])
     for name, value in tpl.get("fixed", {}).items():
+        if name in product_names(tpl):
+            continue
         body = body.replace("{{" + name + "}}", value)
     for name in tpl.get("shared", {}):
         body = body.replace("{{" + name + "}}", sentinel(name))
@@ -111,6 +204,12 @@ def build(tpl, slide, depth):
     for name, value in fixed.items():
         raw["template"] = raw["template"].replace("{{" + name + "}}", value)
     raw["conflicts"] = prune_conflicts(slide.get("conflicts", []), fixed, raw)
+    if tpl.get("product_pool") is not None:
+        def defer(s):
+            return sp.PH.sub(lambda m: sentinel(m.group(1).strip()) if m.group(1).strip() in product_names(tpl) else m.group(0), s)
+        raw = map_strings(raw, defer)
+        fixed = map_strings(fixed, defer)
+        originals = map_strings(originals, defer)
     return raw, fixed, originals
 
 
@@ -205,10 +304,14 @@ def deal_shared(tpl, sets, depth, rng):
     return out
 
 
-def render(spec, row, shared_values):
+def render(spec, row, shared_values, products=None):
     s = sp.render(spec, row["values"])
     for name, value in shared_values.items():
         s = s.replace(sentinel(name), value)
+    if products:
+        s = sp.PH.sub(lambda m: products.get(m.group(1).strip(), m.group(0)), s)
+        for name, value in products.items():
+            s = s.replace(sentinel(name), value)
     if "\x00" in s or sp.PH.search(s):
         raise TemplateError("渲染后还有没替换掉的占位符")
     return s
@@ -224,6 +327,36 @@ def validate(tpl, tpl_dir):
     """模板本身的检查，不看深度。"""
     errors, ids = [], set()
     shared, fixed_names = set(tpl.get("shared", {})), set(tpl.get("fixed", {}))
+    products = product_names(tpl)
+    pool = tpl.get("product_pool")
+    if pool is not None:
+        if not isinstance(pool, dict):
+            return ["product_pool 必须是对象"]
+        items, k = pool.get("items", []), pool.get("per_set")
+        if not isinstance(items, list) or not items or any(not isinstance(p, dict) for p in items):
+            return ["product_pool.items 必须是非空款式对象列表"]
+        if not isinstance(k, int) or isinstance(k, bool) or not 1 <= k <= len(items):
+            return ["product_pool.per_set 必须是正整数，且不超过池子大小"]
+        if not isinstance(pool.get("common_description"), str) or not pool["common_description"].strip():
+            errors.append("product_pool.common_description 不能为空")
+        names, files = set(), set()
+        for p in items:
+            name, ref, desc = p.get("name"), p.get("ref"), p.get("description")
+            if not isinstance(name, str) or not name.strip() or name in names:
+                errors.append(f"款名为空或重复：{name}")
+            names.add(name)
+            if not isinstance(ref, str) or not ref or not (tpl_dir / ref).is_file():
+                errors.append(f"款式 {name} 找不到裁图：{ref}")
+            elif Path(ref).name in files:
+                errors.append(f"裁图文件名重复，复制时会冲突：{ref}")
+            else:
+                files.add(Path(ref).name)
+            if not isinstance(desc, str) or not desc.strip():
+                errors.append(f"款式 {name} 描述不能为空")
+            if any(sp.PH.search(v) for v in [name or "", ref or "", desc or ""]):
+                errors.append(f"款式 {name} 的名字、裁图和描述不能包含占位符")
+        if sp.PH.search(pool.get("common_description", "")):
+            errors.append("common_description 不能包含占位符")
 
     def check_slot(where, name, cfg):
         pool = cfg.get("pool", [])
@@ -266,8 +399,18 @@ def validate(tpl, tpl_dir):
         if clash:
             errors.append(f"{sid}：这些名字和 shared/fixed 重名：{sorted(clash)}")
         used = set(sp.PH.findall(text(slide["template"])))
-        if used - expected - shared - fixed_names:
-            errors.append(f"{sid}：模板里有没定义的占位符 {sorted(used - expected - shared - fixed_names)}")
+        if used - expected - shared - fixed_names - products:
+            errors.append(f"{sid}：模板里有没定义的占位符 {sorted(used - expected - shared - fixed_names - products)}")
+        if pool is not None:
+            all_used = set()
+            map_strings(slide, lambda s: all_used.update(sp.PH.findall(s)) or s)
+            unknown = all_used - expected - shared - fixed_names - products
+            if unknown:
+                errors.append(f"{sid}：正文或选项里有没定义的占位符 {sorted(unknown)}")
+            if slide.get("use_products") and slide.get("refs"):
+                errors.append(f"{sid}：use_products 画面不可另带固定 refs；只带本套抽到的裁图")
+            if not slide.get("use_products") and all_used & products:
+                errors.append(f"{sid}：引用款式占位符时必须设置 use_products: true")
         if expected - used:
             errors.append(f"{sid}：这些可变点定义了但模板里没用到 {sorted(expected - used)}")
     return errors
@@ -344,6 +487,7 @@ def main():
     ap.add_argument("--min-diff", type=int, help="同一张画面任意两套至少几处不同；默认是会变的可变点数的一半")
     ap.add_argument("--screenshot", action="store_true", help="另带整张截图做构图参考，只允许 1～6 档")
     ap.add_argument("--model", help="写进 jobs 文件的模型名，不写就用 render.py 的默认")
+    ap.add_argument("--products", nargs="+", help="在款式池中点名：刚好每套款数则固定，多于则仅在点名款之间均衡轮换")
     ap.add_argument("--template", default=str(DEFAULT_TEMPLATE))
     ap.add_argument("-o", "--out", help="输出文件夹，默认 <当前目录>/圣诞珍珠画01-<时间>-深度N-M套")
     ap.add_argument("--max-seconds", type=float, default=30, help="每张画面每个差异要求最多试多久")
@@ -355,6 +499,14 @@ def main():
     tpl = json.loads(tpl_bytes.decode("utf-8-sig"))
     tpl_dir = tpl_path.parent
     if args.check:
+        if args.products:
+            errors = validate(tpl, tpl_dir)
+            if errors:
+                sys.exit("[错误] " + "；".join(errors))
+            try:
+                deal_products(tpl, 1, args.seed or 0, args.products)
+            except TemplateError as e:
+                sys.exit(f"[错误] {e}")
         return run_check(tpl, tpl_dir)
     errors = validate(tpl, tpl_dir)
     if errors:
@@ -368,6 +520,10 @@ def main():
 
     seed = args.seed if args.seed is not None else random.SystemRandom().randrange(10 ** 6)
     slides = pick_slides(tpl, args.slides)
+    try:
+        products = deal_products(tpl, args.sets, seed, args.products)
+    except TemplateError as e:
+        sys.exit(f"[错误] {e}")
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out = Path(args.out).resolve() if args.out else \
         Path.cwd() / f"{tpl.get('name', 'batch')}-{stamp}-深度{args.depth}-{args.sets}套"
@@ -380,7 +536,7 @@ def main():
     (out / "提示词").mkdir(parents=True, exist_ok=True)
     (out / "参考图").mkdir(exist_ok=True)
 
-    results, table, trial, formal = [], [], [], []
+    results, table, jobs = [], [], []
     for slide in slides:
         try:
             raw, fixed, originals = build(tpl, slide, args.depth)
@@ -401,13 +557,31 @@ def main():
         for i, row in enumerate(rows[:args.sets]):
             set_label = f"第{i + 1:0{width}d}套"
             sv = {n: shared[n][i] for n in shared}
-            prompt = render(spec, row, sv)
+            pv = product_values(tpl, products["rows"][i]) if products and slide.get("use_products") else None
+            job_refs = ref_paths
+            if pv:
+                job_refs = []
+                for p in products["rows"][i]:
+                    dst = out / "参考图" / Path(p["ref"]).name
+                    if not dst.exists():
+                        shutil.copy2(tpl_dir / p["ref"], dst)
+                    job_refs.append(f"参考图/{dst.name}")
+            prompt = render(spec, row, sv, pv)
             name = f"{set_label}-{slide['id']}"
             fname = f"{name}-提示词.txt"
             (out / "提示词" / fname).write_bytes(prompt.encode("utf-8"))
-            job = {"name": name, "prompt": f"提示词/{fname}", "refs": ref_paths, "count": 1, "size": slide["size"]}
-            (trial if i == 0 else formal).append(job)
+            job = {"name": name, "prompt": f"提示词/{fname}", "refs": job_refs, "count": 1, "size": slide["size"]}
+            jobs.append(job)
             table += csv_rows(set_label, slide["id"], fname, spec, row, fixed, originals, slide.get("groups", []))
+            if pv:
+                def resolved(value):
+                    value = sp.PH.sub(lambda m: pv.get(m.group(1).strip(), m.group(0)), value)
+                    for key, replacement in pv.items():
+                        value = value.replace(sentinel(key), replacement)
+                    return value
+                table = [[*r[:4], resolved(r[4]), *r[5:]]
+                         if r[0] == set_label and r[1] == slide["id"] else r for r in table]
+                table.append([set_label, slide["id"], fname, "产品款式", "、".join(p["name"] for p in products["rows"][i]), products["source"], ""])
             for n in shared:
                 orig = tpl["shared"][n].get("original")
                 table.append([set_label, slide["id"], fname, n, sv[n], "每套共用",
@@ -416,7 +590,8 @@ def main():
         n_shared = sum(len(set(shared[n])) > 1 for n in shared)
         results.append({"id": slide["id"], "varied": n_var, "fixed": fixed_names(spec, fixed), "min_diff_target": target,
                         "min_diff_used": used_md, "min_diff_actual": min_pairwise(vectors),
-                        "varied_with_shared": n_var + n_shared, "refs": ref_paths})
+                        "varied_with_shared": n_var + n_shared, "refs": ref_paths,
+                        **({"refs_per_job": tpl["product_pool"]["per_set"]} if products and slide.get("use_products") else {})})
 
     def write_jobs(fname, jobs):
         spec = {"prompt_skill": tpl.get("name", "圣诞珍珠画01")}
@@ -425,11 +600,8 @@ def main():
         spec["jobs"] = jobs
         (out / fname).write_text(json.dumps(spec, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
-    trial.sort(key=lambda j: j["name"])
-    formal.sort(key=lambda j: j["name"])
-    write_jobs("jobs-试跑.json", trial)
-    if formal:
-        write_jobs("jobs-正式.json", formal)
+    jobs.sort(key=lambda j: j["name"])
+    write_jobs("jobs.json", jobs)
     with open(out / "抽取明细.csv", "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
         w.writerow(["套", "画面", "提示词文件", "可变点", "取值", "来源", "是原图做法"])
@@ -437,7 +609,14 @@ def main():
     meta = {"template": str(tpl_path), "template_sha256": hashlib.sha256(tpl_bytes).hexdigest(),
             "created": datetime.now().isoformat(timespec="seconds"), "depth": args.depth, "sets": args.sets,
             "seed": seed, "screenshot": args.screenshot, "slides": results,
-            "jobs": {"trial": "jobs-试跑.json", "formal": "jobs-正式.json" if formal else None}}
+            "jobs": "jobs.json"}
+    if products:
+        meta.update({"product_pool": tpl["product_pool"], "products_requested": args.products,
+                     "product_counts": products["counts"], "repeated_combos": products["repeated_combos"],
+                     "products_by_set": [{"set": f"第{i + 1:0{width}d}套", "source": products["source"],
+                                          "products": [p["name"] for p in row],
+                                          "refs": [f"参考图/{Path(p['ref']).name}" for p in row]}
+                                         for i, row in enumerate(products["rows"])]})
     (out / "batch.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     print(f"深度 {args.depth}，{args.sets} 套，种子 {seed} → {out}")
@@ -446,9 +625,11 @@ def main():
             f"（要求 {r['min_diff_target']} 处凑不够，降到 {r['min_diff_used']} 处）"
         actual = "-" if r["min_diff_actual"] is None else r["min_diff_actual"]
         print(f"  {r['id']}：会变 {r['varied']} 处 + 每套共用 {len(shared)} 处，固定 {len(r['fixed'])} 处；"
-              f"任意两套至少 {actual} 处不同{note}；带图 {len(r['refs'])} 张")
-    print(f"  提示词 {len(trial) + len(formal)} 条；试跑 jobs-试跑.json {len(trial)} 张"
-          + (f"，正式 jobs-正式.json {len(formal)} 张" if formal else ""))
+              f"任意两套至少 {actual} 处不同{note}；带图 {r.get('refs_per_job', len(r['refs']))} 张")
+    if products:
+        print("  款式出现次数：" + "，".join(f"{n} {c}次" for n, c in products["counts"].items()))
+        print(f"  重复出现的款式组合：{products['repeated_combos']} 套")
+    print(f"  提示词 {len(jobs)} 条，jobs.json {len(jobs)} 张")
     if args.screenshot:
         print("[提醒] 带了整张截图：L008 记录过截图里的轮播圆点会被画进图里，出图后要检查")
 
