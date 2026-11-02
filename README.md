@@ -1,5 +1,7 @@
 # 圣诞珍珠画01
 
+> **已并入 [pinshuai-image-template](https://github.com/Kangaroochan/pinshuai-image-template)（2026-11-02）。** 本仓库不再更新。这个模板现在是新仓库里的 `templates/圣诞珍珠画01/`，用法是 `python scripts/make_batch.py --template 圣诞珍珠画01 --sets 10`。新安装请克隆新仓库，并把 Codex 技能目录里旧的 `圣诞珍珠画01` 文件夹移走，免得两个 skill 同时触发。
+
 圣诞老人和小鹿珠钻画挂饰那套三张轮播的批量模板：
 
 1. 开场四宫格："10/10 Christmas activity to / do with your mom/sister 🎄"
